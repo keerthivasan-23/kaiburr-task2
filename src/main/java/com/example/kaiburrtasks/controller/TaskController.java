@@ -23,6 +23,18 @@ import org.springframework.web.bind.annotation.RestController;
 import com.example.kaiburrtasks.model.Task;
 import com.example.kaiburrtasks.model.TaskExecution;
 import com.example.kaiburrtasks.repository.TaskRepository;
+import io.kubernetes.client.openapi.ApiClient;
+import io.kubernetes.client.openapi.ApiException;
+import io.kubernetes.client.openapi.apis.CoreV1Api;
+import io.kubernetes.client.openapi.models.V1Pod;
+import io.kubernetes.client.openapi.models.V1PodSpec;
+import io.kubernetes.client.openapi.models.V1Container;
+import io.kubernetes.client.openapi.models.V1ObjectMeta;
+import io.kubernetes.client.util.ClientBuilder;
+import io.kubernetes.client.util.KubeConfig;
+
+import java.io.FileReader;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/tasks")
@@ -112,8 +124,7 @@ public class TaskController {
     return lower.startsWith("echo") || 
            lower.startsWith("dir") || 
            lower.startsWith("ping");
-}
-@PutMapping("/{id}/executions")
+}@PutMapping("/{id}/executions")
 public ResponseEntity<?> runTask(@PathVariable String id) {
     Optional<Task> taskOptional = taskRepository.findById(id);
     if (taskOptional.isEmpty()) {
@@ -126,40 +137,85 @@ public ResponseEntity<?> runTask(@PathVariable String id) {
         return new ResponseEntity<>("Invalid or unsafe command!", HttpStatus.BAD_REQUEST);
     }
 
-    Instant start = Instant.now();
-    StringBuilder output = new StringBuilder();
+    String namespace = "default"; // change if your app is deployed elsewhere
+    String podName = "exec-" + System.currentTimeMillis();
 
     try {
-        // Always run via Windows cmd
-        ProcessBuilder builder = new ProcessBuilder("cmd.exe", "/c", task.getCommand());
-        builder.redirectErrorStream(true); // merge stdout + stderr
-        Process process = builder.start();
+        // 1. Connect to Kubernetes API
+        ApiClient client;
+        try {
+            client = ClientBuilder.cluster().build(); // in-cluster
+        } catch (Exception e) {
+            String kubeConfigPath = System.getProperty("user.home") + "/.kube/config"; // local dev
+            client = ClientBuilder.kubeconfig(KubeConfig.loadKubeConfig(new FileReader(kubeConfigPath))).build();
+        }
+        io.kubernetes.client.openapi.Configuration.setDefaultApiClient(client);
+        CoreV1Api coreApi = new CoreV1Api(client);
 
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                output.append(line).append("\n");
+        // 2. Define the busybox pod
+        V1Pod pod = new V1Pod()
+                .metadata(new V1ObjectMeta()
+                        .name(podName)
+                        .labels(Map.of("job", "task-exec")))
+                .spec(new V1PodSpec()
+                        .restartPolicy("Never")
+                        .containers(List.of(
+                                new V1Container()
+                                        .name("runner")
+                                        .image("busybox:1.36.1")
+                                        .command(List.of("sh", "-c", task.getCommand()))
+                        )));
+
+        // 3. Create the pod
+        coreApi.createNamespacedPod(namespace, pod, null, null, null, null);
+
+        // 4. Wait until pod finishes
+        String phase = "Pending";
+        long startTimeMillis = System.currentTimeMillis();
+        while (System.currentTimeMillis() - startTimeMillis < 60_000) { // timeout 60s
+            V1Pod current = coreApi.readNamespacedPodStatus(podName, namespace, null);
+            phase = current.getStatus().getPhase();
+            if ("Succeeded".equals(phase) || "Failed".equals(phase)) {
+                break;
             }
+            Thread.sleep(1000);
         }
 
-        int exitCode = process.waitFor();
-        if (exitCode != 0) {
-            return new ResponseEntity<>("Command failed with exit code: " + exitCode 
-                    + "\nOutput: " + output, HttpStatus.INTERNAL_SERVER_ERROR);
-        }
+        // 5. Collect logs
+        String logs = coreApi.readNamespacedPodLog(
+                podName,
+                namespace,
+                "runner",
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null
+        );
 
-    } catch (IOException | InterruptedException e) {
-    return new ResponseEntity<>("Error while executing command: " + e.getMessage(),
-            HttpStatus.INTERNAL_SERVER_ERROR);
-        }
+        // 6. Delete pod afterwards
+        try {
+            coreApi.deleteNamespacedPod(podName, namespace, null, null, null, null, null, null);
+        } catch (Exception ignored) {}
 
-    Instant end = Instant.now();
-    TaskExecution execution = new TaskExecution(start, end, output.toString().trim());
+        // 7. Save execution in DB
+        Instant start = Instant.ofEpochMilli(startTimeMillis);
+        Instant end = Instant.now();
+        TaskExecution execution = new TaskExecution(start, end, logs.trim());
 
-    task.getTaskExecutions().add(execution);
-    taskRepository.save(task);
+        task.getTaskExecutions().add(execution);
+        taskRepository.save(task);
 
-    return new ResponseEntity<>(execution, HttpStatus.OK);
+        return new ResponseEntity<>(execution, HttpStatus.OK);
+
+    } catch (Exception e) {
+        e.printStackTrace();
+        return new ResponseEntity<>("Error while executing in Kubernetes: " + e.getMessage(),
+                HttpStatus.INTERNAL_SERVER_ERROR);
+    }
 }
 
 }

@@ -1,0 +1,73 @@
+# app-deployment.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  MONGO_URI: "mongodb://mongo:27017/tasksdb"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-creator-sa
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-creator-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pod-creator-binding
+subjects:
+  - kind: ServiceAccount
+    name: pod-creator-sa
+roleRef:
+  kind: Role
+  name: pod-creator-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taskapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: taskapp
+  template:
+    metadata:
+      labels:
+        app: taskapp
+    spec:
+      serviceAccountName: pod-creator-sa
+      containers:
+        - name: taskapp
+          image: yourdockerid/taskapp:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: MONGO_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: app-config
+                  key: MONGO_URI
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: taskapp-service
+spec:
+  selector:
+    app: taskapp
+  ports:
+    - port: 8080
+      nodePort: 30080
+      targetPort: 8080
+  type: NodePort
