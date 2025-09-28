@@ -21,5 +21,5 @@ Each task represents a shell command and stores its execution history in MongoDB
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/<your-username>/kaiburr-task1.git
+git clone https://github.com/keerthivasan-23/kaiburr-task1.git
 cd kaiburr-task1
